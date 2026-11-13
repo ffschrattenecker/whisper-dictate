@@ -1,0 +1,10 @@
+{
+  "server_url": "http://127.0.0.1:8080",
+  "language": "auto",
+  "prompt": "",
+  "injector": "auto",
+  "type_delay_ms": 0,
+  "replacements": null,
+  "source": "",
+  "sound_cues": true
+}

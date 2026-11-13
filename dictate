@@ -1,0 +1,866 @@
+#!/usr/bin/env python3
+"""Toggle-style local dictation for Linux: press a hotkey to start recording,
+press it again to stop, transcribe the clip via a resident whisper.cpp
+server, and type the text into the focused window. Python standard library
+only."""
+
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+import wave
+from pathlib import Path
+
+DEFAULTS = {
+    # Resident whisper.cpp server. Keep it running:
+    #   systemctl --user enable --now whisper-server
+    "server_url": "http://127.0.0.1:8080",
+    "language": "auto",  # ISO code for the server request, e.g. "en"; "auto" = detect
+    "prompt": "",        # initial prompt for whisper models (server request)
+    "injector": "auto",  # auto | kwin | clipboard
+    # Pause between characters while typing (milliseconds).  0 (default)
+    # types the whole transcript in one burst, which KWin handles fine;
+    # raise this only if some app ever misses characters.
+    "type_delay_ms": 0.0,
+    # Spoken phrases replaced with special characters in the transcript
+    # (see DEFAULT_REPLACEMENTS). Merged over the defaults: a value of null
+    # removes that trigger, any other value adds/overrides it.
+    "replacements": None,
+    # PipeWire node name or serial to record from, e.g.
+    # "alsa_input.usb-Focusrite...Direct__Direct__source" or "50" (pw-record
+    # --target). Empty = default source.
+    "source": "",
+    "sound_cues": True,
+}
+
+MIN_DURATION_S = 0.3
+RESTORE_DELAY_S = 0.7
+VERSION = "1.0.0"
+
+HALLUCINATIONS = {
+    "thank you.",
+    "thanks for watching!",
+    "thank you for watching!",
+    "thank you for subscribing.",
+    "subscribe to my channel",
+    "bye.",
+    "okay.",
+    ".",
+    "you",
+    "[blank_audio]",
+}
+
+# Spoken phrases turned into characters in the transcript.  Only phrases
+# that are never natural standalone words are defaults, so ordinary
+# sentences survive unchanged.  "literal <phrase>" types it as words.
+DEFAULT_REPLACEMENTS = {
+    "exclamation mark": "!",
+    "exclamation point": "!",
+    "question mark": "?",
+    "semicolon": ";",
+    "asterisk": "*",
+    "backslash": "\\",
+    "forward slash": "/",
+    "slash sign": "/",
+    "percent sign": "%",
+    "dollar sign": "$",
+    "ampersand": "&",
+    "at sign": "@",
+    "number sign": "#",
+    "underscore": "_",
+    "pipe sign": "|",
+    "opening parenthesis": "(",
+    "closing parenthesis": ")",
+    "opening bracket": "[",
+    "closing bracket": "]",
+    "opening brace": "{",
+    "closing brace": "}",
+    "less than sign": "<",
+    "greater than sign": ">",
+    "equal sign": "=",
+    "plus sign": "+",
+    "backtick": "`",
+    "tilde": "~",
+    "caret": "^",
+}
+
+LITERAL_WORD = "literal"  # "literal asterisk" types the word "asterisk"
+
+
+def paths():
+    home = Path.home()
+    cache = Path(os.environ.get("XDG_CACHE_HOME", home / ".cache")) / "dictate"
+    return {
+        "config": home / ".config" / "dictate" / "config.json",
+        "lock": cache / "recorder.json",
+        "busy": cache / "busy",
+        "inject": cache / "inject.lock",
+        "log": cache / "recorder.log",
+    }
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    p = paths()["config"]
+    if p.is_file():
+        try:
+            cfg.update(json.loads(p.read_text()))
+        except (json.JSONDecodeError, OSError) as e:
+            die(f"cannot read config {p}: {e}")
+    return cfg
+
+
+def die(msg, code=1):
+    notify(f"Dictation: {msg}")
+    print(f"dictate: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def notify(msg):
+    if shutil.which("notify-send"):
+        try:
+            subprocess.Popen(
+                ["notify-send", "-a", "Dictation", "-t", "4000", msg],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            pass
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def pid_cmdline(pid):
+    """Command line of a process, or "" if it is gone or unreadable.
+    Lock files outlive their processes; a reused pid must never be
+    mistaken for the one the lock was written for."""
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return ""
+    return raw.replace(b"\x00", b" ").decode(errors="replace")
+
+
+def read_lock():
+    p = paths()["lock"]
+    try:
+        data = json.loads(p.read_text())
+        if pid_alive(data.get("pid", -1)):
+            return data
+        p.unlink(missing_ok=True)
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def write_lock(pid, raw):
+    paths()["lock"].parent.mkdir(parents=True, exist_ok=True)
+    paths()["lock"].write_text(json.dumps(
+        {"pid": pid, "start": time.time(), "raw": str(raw)}))
+
+
+def clip_dir():
+    """Clip storage: XDG_RUNTIME_DIR when available, a per-user 0700
+    tmpfs — raw dictation audio never touches the disk and vanishes at
+    logout. Falls back to the cache dir (hardened to 0700)."""
+    xdg = os.environ.get("XDG_RUNTIME_DIR", "")
+    d = (Path(xdg) if xdg and Path(xdg).is_dir() else None)
+    d = d / "dictate" if d else paths()["lock"].parent
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        d.chmod(0o700)
+    except OSError:
+        pass
+    return d
+
+
+def tmp_clip_path():
+    # unique per recording, so a clip being typed while the next records
+    # can never collide
+    return clip_dir() / f"clip-{os.getpid()}.raw"
+
+
+BEEP_AMP = 6000  # synthesis amplitude; lower = quieter
+
+
+def synth_beep(path, freq, ms):
+    import math
+    import struct as st
+    rate = 16000
+    n = int(rate * ms / 1000)
+    fade = max(1, int(rate * 0.004))
+    frames = bytearray()
+    for i in range(n):
+        amp = BEEP_AMP
+        if i < fade:
+            amp = amp * i // fade
+        if n - i < fade:
+            amp = amp * (n - i) // fade
+        frames += st.pack("<h", int(amp * math.sin(2 * math.pi * freq * i / rate)))
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(bytes(frames))
+
+
+def play_sound(cfg, freq, ms):
+    if not cfg.get("sound_cues", True):
+        return
+    d = paths()["lock"].parent
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / f"beep-{freq}-{BEEP_AMP}.wav"
+    if not f.exists():
+        synth_beep(f, freq, ms)
+    for player in ("paplay", "pw-play", "aplay"):
+        if shutil.which(player):
+            try:
+                subprocess.Popen(
+                    [player, str(f)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except OSError:
+                pass
+            return
+
+
+def recorder_cmd(cfg, out):
+    if not shutil.which("pw-record"):
+        die("pw-record not found: install pipewire")
+    cmd = ["pw-record", "--rate", "16000", "--channels", "1",
+           "--format", "s16"]
+    src = (cfg.get("source") or "").strip()
+    if src:
+        cmd += ["--target", src]
+    return cmd + ["--raw", out]
+
+
+def check_source(cfg):
+    """Refuse to record a desktop-audio monitor: it captures what plays on
+    the speakers, not the microphone."""
+    if (cfg.get("source") or "").strip() or not shutil.which("pactl"):
+        return
+    try:
+        r = subprocess.run(
+            ["pactl", "get-default-source"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            timeout=5,
+        )
+        default = r.stdout.strip() if r.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    if default.endswith(".monitor"):
+        die("default audio source is a desktop-audio monitor, not a "
+            "microphone; set your mic as default input (wpctl status / "
+            "wpctl set-default <id>, or your desktop sound settings) or add "
+            'a "source" entry in the config')
+
+
+def start_recording(cfg):
+    if read_lock():
+        print("dictate: already recording")
+        return
+    try:
+        if time.time() - paths()["busy"].stat().st_mtime < 20:
+            notify("Dictation: still transcribing, wait a moment")
+            return
+    except OSError:
+        pass
+    check_source(cfg)
+
+    raw = tmp_clip_path()
+    cmd = recorder_cmd(cfg, raw)
+    with open(paths()["log"], "wb") as log:
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=log, stderr=log,
+                stdin=subprocess.DEVNULL, start_new_session=True,
+            )
+        except OSError as e:
+            die(f"cannot start recorder: {e}")
+    write_lock(proc.pid, raw)
+    play_sound(cfg, 880, 90)
+    notify("Dictation: recording... press hotkey again to finish")
+
+
+def acquire_inject_slot():
+    """Serialize injections: the next recording may start while the
+    previous text still types, but two injections never interleave."""
+    p = paths()["inject"]
+    deadline = time.time() + 30
+    while True:
+        try:
+            data = json.loads(p.read_text())
+            pid = data.get("pid", -1)
+            # a reused pid is not a stuck injector: only wait for a
+            # process that is still a dictate
+            if pid_alive(pid) and "dictate" in pid_cmdline(pid):
+                if time.time() > deadline:
+                    return False  # previous injector seems stuck; proceed
+                time.sleep(0.05)
+                continue
+        except (OSError, ValueError):
+            pass
+        break
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"pid": os.getpid()}))
+    return True
+
+
+def stop_recording():
+    lock = read_lock()
+    if not lock:
+        return None
+    pid = lock["pid"]
+    raw = Path(lock["raw"])
+    if "pw-record" not in pid_cmdline(pid):
+        # the recorder died and the pid was reused: never signal the
+        # unrelated process that owns it now
+        paths()["lock"].unlink(missing_ok=True)
+        raw.unlink(missing_ok=True)
+        return None
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+    except OSError:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    for _ in range(50):
+        if not pid_alive(pid):
+            break
+        time.sleep(0.05)
+    if pid_alive(pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    paths()["lock"].unlink(missing_ok=True)
+    return raw
+
+
+def raw_to_wav(raw, rate=16000):
+    data = raw.read_bytes()
+    if not data:
+        raw.unlink(missing_ok=True)
+        die("empty recording")
+    wav = raw.with_suffix(".wav")
+    with wave.open(str(wav), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(data)
+    duration = len(data) / (2.0 * rate)
+    raw.unlink(missing_ok=True)
+    return wav, duration
+
+
+def replacement_rules(cfg):
+    """Config entries override the defaults; a null value removes."""
+    rules = dict(DEFAULT_REPLACEMENTS)
+    user = cfg.get("replacements")
+    if isinstance(user, dict):
+        for spoken, char in user.items():
+            spoken = str(spoken).strip()
+            if not spoken:
+                continue
+            if char is None or str(char).strip() == "":
+                rules.pop(spoken, None)
+            else:
+                rules[spoken] = str(char)
+    return rules
+
+
+def apply_replacements(text, cfg):
+    """Replace spoken special-character phrases with their characters,
+    matching on word boundaries only.  "literal <phrase>" escapes — but
+    only when a trigger actually follows, so "in literal terms this
+    fails" is never mangled."""
+    rules = replacement_rules(cfg)
+    if not rules:
+        return text
+    # longest phrases first, so "forward slash" is tried before "slash sign"
+    phrase_res = [(re.compile(rf"\b{re.escape(p)}\b", re.IGNORECASE), rules[p])
+                  for p in sorted(rules, key=len, reverse=True)]
+
+    def subst(seg):
+        for prex, char in phrase_res:
+            seg = prex.sub(lambda m: char, seg)
+        return seg
+
+    literal_re = re.compile(rf"\b{re.escape(LITERAL_WORD)}\b", re.IGNORECASE)
+    out = []
+    protected = []  # phrases kept as words; referenced by placeholder
+    pos = 0
+    while True:
+        m = literal_re.search(text, pos)
+        end = m.start() if m else len(text)
+        out.append(subst(text[pos:end]))
+        if not m:
+            break
+        j = m.end()
+        while j < len(text) and text[j].isspace():
+            j += 1
+        hit = next((pr.match(text, j) for pr, _ in phrase_res if pr.match(text, j)), None)
+        if hit is None:
+            # a "literal" in front of ordinary words: keep it as plain text
+            out.append(text[m.start():m.end()])
+            pos = m.end()
+            continue
+        protected.append(hit.group(0))
+        out.append(f"\x01{len(protected) - 1}\x01")
+        pos = hit.end()
+    result = "".join(out)
+    for idx, seg in enumerate(protected):
+        result = result.replace(f"\x01{idx}\x01", seg, 1)
+    return result
+
+
+def clean_text(text, duration, cfg):
+    text = apply_replacements(" ".join(text.split()), cfg)
+    if duration < 3.0 and text.lower() in HALLUCINATIONS:
+        return ""
+    return text
+
+
+def multipart(fields, files):
+    boundary = "----dictate" + os.urandom(12).hex()
+    body = bytearray()
+    for name, value in fields.items():
+        body += f"--{boundary}\r\n".encode()
+        body += f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode()
+        body += f"{value}\r\n".encode()
+    for name, (filename, data, ctype) in files.items():
+        body += f"--{boundary}\r\n".encode()
+        body += (
+            f'Content-Disposition: form-data; name="{name}"; '
+            f'filename="{filename}"\r\n'
+            f"Content-Type: {ctype}\r\n\r\n"
+        ).encode()
+        body += data + b"\r\n"
+    body += f"--{boundary}--\r\n".encode()
+    return bytes(body), f"multipart/form-data; boundary={boundary}"
+
+
+def http_post(url, body, ctype, timeout=120):
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Content-Type", ctype)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")[:300]
+        die(f"server error {e.code} from {url}: {detail}")
+    except urllib.error.URLError as e:
+        die(f"cannot reach {url} (start whisper-server: "
+            "systemctl --user start whisper-server): {e.reason}")
+    except json.JSONDecodeError:
+        die(f"invalid JSON response from {url}")
+
+
+def transcribe(wav, duration, cfg):
+    url = (cfg.get("server_url") or "").strip()
+    if not url:
+        die("no server_url in config (see config.example.json)")
+    with open(wav, "rb") as f:
+        audio = f.read()
+    fields = {"response_format": "json"}
+    lang = cfg.get("language") or ""
+    if lang not in ("", "auto", None):
+        fields["language"] = lang
+    if cfg.get("prompt"):
+        fields["prompt"] = cfg["prompt"]
+    body, ctype = multipart(fields, {"file": ("clip.wav", audio, "audio/wav")})
+    data = http_post(f"{url.rstrip('/')}/inference", body, ctype)
+    text = data.get("text", "") if isinstance(data, dict) else ""
+    return clean_text(text, duration, cfg)
+
+
+def run(cmd, stdin_text=None):
+    try:
+        return subprocess.run(
+            cmd, input=stdin_text, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return subprocess.CompletedProcess(cmd, 1)
+
+
+def run_bytes(cmd):
+    try:
+        return subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10,
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def run_quiet(cmd):
+    # wl-copy forks a background clipboard server inheriting our pipes;
+    # DEVNULL keeps it from blocking until timeout
+    try:
+        return subprocess.run(
+            cmd, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return subprocess.CompletedProcess(cmd, 1)
+
+
+KWIN_FAKE_INPUT = "org_kde_kwin_fake_input"
+
+
+def _wl_msg(obj, opcode, payload=b""):
+    return struct.pack("<IHH", obj, opcode, 8 + len(payload)) + payload
+
+
+def _wl_str(s):
+    b = s.encode() + b"\x00"
+    return struct.pack("<I", len(b)) + b + b"\x00" * (-len(b) % 4)
+
+
+def _wl_event_wait(sock, obj, opcode, timeout=3.0):
+    """Read events until (obj, opcode) arrives, skipping anything else
+    pending; returns the event body, or None on timeout."""
+    buf = b""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        while len(buf) >= 8:
+            sender, op, size = struct.unpack("<IHH", buf[:8])
+            if size < 8 or len(buf) < size:
+                break
+            body = buf[8:size]
+            buf = buf[size:]
+            if sender == obj and op == opcode:
+                return body
+        sock.settimeout(max(0.05, deadline - time.time()))
+        chunk = sock.recv(4096)
+        if not chunk:
+            return None
+        buf += chunk
+    return None
+
+
+def _wl_sync(sock):
+    """wl_display.sync round-trip: returns once the compositor has processed
+    every request sent so far (calls its callback, object id 4)."""
+    sock.sendall(_wl_msg(1, 0, struct.pack("<I", 4)))
+    return _wl_event_wait(sock, 4, 0) is not None
+
+
+def kwin_connect():
+    """Connected, authenticated org_kde_kwin_fake_input socket; None when
+    KWin's fake_input protocol v6 is unavailable (no Plasma Wayland
+    session, X11, older KWin)."""
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    wld = os.environ.get("WAYLAND_DISPLAY")
+    if not xdg or not wld:
+        return None
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(3.0)
+        sock.connect(os.path.join(xdg, wld))
+    except OSError:
+        return None
+    ok = False
+    try:
+        # fetch the registry and look for the fake_input global
+        sock.sendall(_wl_msg(1, 1, struct.pack("<I", 2)))  # get_registry
+        name = version = None
+        buf = b""
+        deadline = time.time() + 3.0
+        while name is None and time.time() < deadline:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+            while len(buf) >= 8 and name is None:
+                _, opcode, size = struct.unpack("<IHH", buf[:8])
+                if len(buf) < size:
+                    break
+                body = buf[8:size]
+                buf = buf[size:]
+                if opcode != 0 or len(body) < 12:  # wl_registry.global
+                    continue
+                gname, slen = struct.unpack("<II", body[:8])
+                if body[8:8 + slen - 1] == KWIN_FAKE_INPUT.encode():
+                    name, version = gname, struct.unpack("<I", body[8 + slen:12 + slen])[0]
+        if name is not None and version >= 6:  # keyboard_keysym needs v6
+            # registry.bind(name, interface, version, id=3)
+            sock.sendall(_wl_msg(2, 0, struct.pack("<I", name) + _wl_str(KWIN_FAKE_INPUT)
+                                 + struct.pack("<II", 6, 3)))
+            # authenticate, then sync: proves KWin consumed it before
+            # any keys, so they are never dropped as unauthenticated
+            sock.sendall(_wl_msg(3, 0, _wl_str("dictate") + _wl_str("dictation text injection")))
+            ok = _wl_sync(sock)
+    except (OSError, struct.error):
+        ok = False
+    if not ok:
+        sock.close()
+        return None
+    return sock
+
+
+def inject_kwin(text, cfg):
+    """Type text over KWin's fake_input protocol: keysym-based
+    (layout-independent) and works in terminals.  With no inter-key
+    delay the whole keystream goes out in a single write."""
+    sock = kwin_connect()
+    if sock is None:
+        return False
+    delay_s = max(0.0, float(cfg.get("type_delay_ms") or 0.0)) / 1000.0
+    try:
+        # every key is a press+release keysym pair; with no inter-key delay
+        # they all stream to the compositor in a single write
+        keys = bytearray()
+        for ch in text:
+            code = ord(ch)
+            if code <= 0xFF:          # latin-1 keysyms match their codepoint
+                keysym = code
+            else:                     # xkb unicode keysym for the rest
+                keysym = 0x01000000 | code
+            keys += _wl_msg(3, 12, struct.pack("<II", keysym, 1))   # press
+            keys += _wl_msg(3, 12, struct.pack("<II", keysym, 0))   # release
+            if delay_s:
+                sock.sendall(keys)
+                keys.clear()
+                time.sleep(delay_s)
+        if keys:
+            sock.sendall(keys)
+        # keys are queued in KWin already; the sync only nudges them
+        # along, so its timeout is never a failure
+        try:
+            _wl_sync(sock)
+        except OSError:
+            pass
+        return True
+    except (OSError, struct.error):
+        return False
+    finally:
+        sock.close()
+
+
+def kwin_paste():
+    """ctrl+v over the same protocol: some apps (Electron, Java windows)
+    swallow typed keysyms but accept a normal paste.  Used by the
+    clipboard injector."""
+    sock = kwin_connect()
+    if sock is None:
+        return False
+    try:
+        # ctrl down, v down, v up, ctrl up
+        seq = b"".join(_wl_msg(3, 12, struct.pack("<II", ks, down))
+                       for ks, down in ((0xFFE3, 1), (0x76, 1),
+                                        (0x76, 0), (0xFFE3, 0)))
+        sock.sendall(seq)
+        try:
+            _wl_sync(sock)
+        except OSError:
+            pass
+        return True
+    except (OSError, struct.error):
+        return False
+    finally:
+        sock.close()
+
+
+TEXT_MIME_PREFS = ("text/plain;charset=utf-8", "UTF8_STRING",
+                   "text/plain", "STRING", "TEXT")
+
+
+def clipboard_snapshot():
+    """Save the current clipboard (mime + raw bytes, not just text, so
+    images survive) for restore; None when it is already empty."""
+    types = run(["wl-paste", "--list-types"]).stdout.split()
+    if not types:
+        return None
+    mime = next((t for t in TEXT_MIME_PREFS if t in types), None)
+    if mime is None:
+        mime = next((t for t in types if t.startswith("text/")), types[0])
+    data = run_bytes(["wl-paste", "--no-newline", "--type", mime])
+    if data is None:
+        return None
+    return mime, data
+
+
+def restore_clipboard(saved):
+    if saved is None:
+        # the clipboard was empty before dictating: clear the transcript off
+        run_quiet(["wl-copy", "--clear"])
+        return
+    mime, data = saved
+    try:
+        # wl-copy reads stdin to EOF before forking its server, so a pipe
+        # never blocks the serve loop
+        subprocess.run(
+            ["wl-copy", "--type", mime], input=data,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def inject_clipboard(text):
+    if not (shutil.which("wl-copy") and shutil.which("wl-paste")):
+        return False
+    saved = clipboard_snapshot()
+    if run_quiet(["wl-copy", text]).returncode != 0:
+        return False
+    if not kwin_paste():
+        restore_clipboard(saved)   # paste never arrived: put things back
+        return False
+    # sleep inline: a thread would die with this short-lived process
+    time.sleep(0.12 + RESTORE_DELAY_S)
+    restore_clipboard(saved)
+    return True
+
+
+def inject(text, cfg):
+    if cfg["injector"] not in ("auto", "kwin", "clipboard"):
+        die(f"unknown injector {cfg['injector']!r} in config (auto, kwin, clipboard)")
+    order = (["kwin", "clipboard"] if cfg["injector"] == "auto"
+             else [cfg["injector"]])
+    for name in order:
+        if name == "kwin" and inject_kwin(text, cfg):
+            return name
+        if name == "clipboard" and inject_clipboard(text):
+            return name
+    return None
+
+
+USAGE = """usage: dictate [options]
+
+Toggle dictation: first invocation starts recording, second stops it,
+transcribes the clip via a resident whisper.cpp server, and types the
+result into the focused window.
+
+options:
+  --file PATH    transcribe an existing audio file instead of recording
+  --stdout       print the text instead of typing it
+  --stop         stop a running recording without transcribing
+  --server URL   whisper-server base URL for this run (overrides the config)
+  --lang CODE    language code for the server request, e.g. en, de (default: auto)
+  --version      print version and exit
+  -h, --help     show this help
+
+config: ~/.config/dictate/config.json (see config.example.json)
+"""
+
+
+def main():
+    args = sys.argv[1:]
+    cfg = load_config()
+    stop_only = False
+    while args:
+        flag = args.pop(0)
+        if flag in ("--help", "-h"):
+            print(USAGE)
+            return
+        if flag == "--version":
+            print(f"dictate {VERSION}")
+            return
+        if flag == "--":
+            break
+        if flag == "--file":
+            if not args:
+                die("--file requires a path")
+            cfg["file"] = args.pop(0)
+        elif flag == "--stdout":
+            cfg["stdout"] = True
+        elif flag == "--stop":
+            stop_only = True
+        elif flag == "--server":
+            if not args:
+                die("--server requires a value")
+            cfg["server_url"] = args.pop(0)
+        elif flag == "--lang":
+            if not args:
+                die("--lang requires a value")
+            cfg["language"] = args.pop(0)
+        else:
+            die(f"unknown option {flag} (see --help)")
+
+    if stop_only:
+        if not read_lock():
+            print("dictate: not recording")
+            return
+        raw = stop_recording()
+        if raw:
+            raw.unlink(missing_ok=True)
+        play_sound(cfg, 660, 120)
+        notify("Dictation: cancelled")
+        return
+
+    if not (cfg.get("server_url") or "").strip():
+        die("no server_url in config (see config.example.json)")
+
+    if cfg.get("file"):
+        src = Path(cfg["file"]).expanduser()
+        if not src.is_file():
+            die(f"no such file: {src}")
+        wav, duration = src, src.stat().st_size / 32000.0
+    else:
+        raw = stop_recording()
+        if raw is None:
+            start_recording(cfg)
+            return
+        if not raw.exists():
+            die("recording vanished")
+        play_sound(cfg, 660, 120)
+        wav, duration = raw_to_wav(raw)
+
+    if duration < MIN_DURATION_S:
+        if not cfg.get("file"):
+            Path(wav).unlink(missing_ok=True)
+        notify("Dictation: recording too short, ignored")
+        return
+
+    paths()["busy"].parent.mkdir(parents=True, exist_ok=True)
+    paths()["busy"].write_text("")
+
+    try:
+        text = transcribe(wav, duration, cfg)
+    finally:
+        if not cfg.get("file"):
+            Path(wav).unlink(missing_ok=True)
+        # busy marker gone: the next recording can start during typing
+        paths()["busy"].unlink(missing_ok=True)
+
+    if not text:
+        notify("Dictation: nothing recognized")
+        return
+
+    if cfg.get("stdout"):
+        print(text)
+        return
+
+    acquire_inject_slot()
+    try:
+        used = inject(text, cfg)
+    finally:
+        paths()["inject"].unlink(missing_ok=True)
+    if not used:
+        die("no text injector available (the kwin injector needs a "
+            "running Plasma Wayland session; the clipboard fallback "
+            "needs wl-clipboard)")
+    notify(f"Dictation: typed via {used}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,5 @@
+__pycache__/
+pkg/
+src/
+*.pkg.tar.*
+/whisper-dictate/

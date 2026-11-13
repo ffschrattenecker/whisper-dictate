@@ -1,0 +1,11 @@
+[Unit]
+Description=whisper.cpp OpenAI-compatible speech server (GPU via Vulkan)
+After=pipewire.service network.target
+
+[Service]
+ExecStart=%h/.local/bin/whisper-server -m %h/.local/share/whisper/ggml-large-v3-turbo.bin -t 4 --host 127.0.0.1 --port 8080
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
